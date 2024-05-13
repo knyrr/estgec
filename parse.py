@@ -1,22 +1,140 @@
+"""Module for creating SQL insert statements for EstGEC-L2-Corpus"""
 import os
 import glob
 import uuid
+import zipfile
+from urllib.parse import urlparse
+import shutil
+import requests
 
-# insert into core.text_error_analysis_sentences(id, text_id, sentence_num, sentence)
-# values  (gen_random_uuid(), core.get_text_id_by_code_or_title('%III_003-052%') ::UUID, 1, 'ak_eriala_analuus');
+URL = "https://github.com/tlu-dt-nlp/EstGEC-L2-Corpus/archive/refs/heads/main.zip"
+CORPUS_DIR = 'EstGEC-L2-Corpus-main'
 
-# insert into core.text_error_analysis_segments(id, sentence_id, scope_start, scope_end, error_type, correction, annotator_id)
-# values('193e5646-6e26-4127-bf73-926c973d801a'::UUID,'193e5646-6e26-4127-bf73-926c973d801c'::UUID,
-#        9, 10, 'R:LEX', 'enda ||oma', 0);
 
-dir = 'EstGEC-L2-Corpus/dev'
-sentences_sql = ''
-segments_sql = ''
-extracted_file_name = ''
-index = 0
+def download_and_unpack_zip(url, output_dir=""):
+    """
+    Download a ZIP file from the given URL, unpack it into the specified directory,
+    and then delete the ZIP file.
+    """
+    parsed_url = urlparse(url)
+    filename = os.path.basename(parsed_url.path)
+    zip_path = os.path.join(output_dir, filename)
+    response = requests.get(url, timeout=10)
+    with open(zip_path, 'wb') as file:
+        file.write(response.content)
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(output_dir)
+    os.remove(zip_path)
 
-mock_file_name = 'A2IV_003-053.txt'
-mock = """
+
+def add_to_annotations_sql(sentence_uuid, annotation):
+    """
+    Return an insert statement for annotation
+    """
+    segments = annotation.split('|||')
+    if len(segments) < 6:
+        print(annotation)
+        raise ValueError("Sentence does not contain enough segments.")
+    scope = segments[0].split()
+    if len(scope) != 2:
+        raise ValueError("Scope does not have exactly two parts.")
+
+    scope_start, scope_end = scope
+    error_type = segments[1]
+    correction = segments[2]
+    annotator_num = segments[5]
+
+    annotation_sql = f"""insert into core.text_error_analysis_annotations(id, sentence_id, scope_start, scope_end, error_type, correction, annotator_id) values ('{uuid.uuid4()}'::UUID, '{sentence_uuid}'::UUID, {scope_start}, {scope_end}, '{error_type}', $${correction}$$, {annotator_num});\n"""
+
+    return annotation_sql
+
+
+def add_to_sentences_sql(sentence_uuid, get_text_id_sql, sentence_index, sentence):
+    """
+    Return an insert statement for sentence
+    """
+    sentence_sql = f"""insert into core.text_error_analysis_sentences(id, text_id, sentence_num, sentence) values ('{sentence_uuid}'::UUID, {get_text_id_sql}::UUID, {sentence_index}, $${sentence}$$);\n"""
+    return sentence_sql
+
+
+def get_text_id(file_name):
+    """
+    Return the function call to get source text id
+    """
+    level = file_name[:2]
+    extracted_file_name = file_name[2:]
+    sql_query = ''
+    if extracted_file_name[0:5] == '_doc_':
+        extracted_file_name = extracted_file_name[1:-4] + '_item'
+        # core.get_text_id_by_full_code_or_title('doc_18538799202_item');
+        sql_query = "core.get_text_id_by_code_or_title('" + \
+            extracted_file_name + "')"
+    elif extracted_file_name[0] == '_':
+        year = extracted_file_name[1:5]
+        extracted_file_name = extracted_file_name[5:-4]
+        # core.get_text_id_by_full_code_or_title('C1 2018 III_003-047');
+        sql_query = "core.get_text_id_by_code_or_title('" + \
+            level + " " + year + " "
+        sql_query += extracted_file_name + "')"
+    else:
+        extracted_file_name = extracted_file_name[:-4]
+        # core.get_text_id_by_code_or_title('C1______III_003-052');
+        sql_query = "core.get_text_id_by_code_or_title('" + \
+            level + "______" + \
+            extracted_file_name + "')"
+    return sql_query
+
+
+def parse_text(file_name, text):
+    """
+    Parse text from file
+    """
+    get_text_id_sql = get_text_id(file_name)
+    lines = text.splitlines()
+    sentence_count = 0
+    segment_count = 0
+    sentence_uuid = ''
+    sentences_sql = ''
+    annotations_sql = ''
+    for line in lines:
+        if line and line[0] == 'S':
+            segment_count = 0
+            sentence_uuid = str(uuid.uuid4())
+            sentence = line[2:]
+            sentences_sql += add_to_sentences_sql(sentence_uuid, get_text_id_sql,
+                                                  sentence_count, sentence)
+            sentence_count += 1
+        elif line and line[0] == 'A':
+            sentence = line[2:]
+            annotations_sql += add_to_annotations_sql(sentence_uuid, sentence)
+            segment_count += 1
+    return sentences_sql, annotations_sql
+
+
+def parse_dir():
+    """
+    Parse corpus directory
+    """
+    sentences_sql = ''
+    annotations_sql = ''
+    for main_dir in glob.glob(os.path.join(CORPUS_DIR, '*/')):
+        for subdir in glob.glob(os.path.join(main_dir, '*/')):
+            for file in glob.glob(os.path.join(subdir, '*.txt')):
+                with open(os.path.join(os.getcwd(), file), 'r', encoding="utf-8") as f:
+                    file_name = os.path.basename(file)
+                    if file_name.find("source") == -1:
+                        text = f.read()
+                        sentences, annotations = parse_text(file_name, text)
+                        sentences_sql += sentences
+                        annotations_sql += annotations
+
+    with open('R__0009-core.text_error_analysis.sql', 'w', encoding="utf-8") as file:
+        file.write(sentences_sql)
+        file.write(annotations_sql)
+
+
+MOCK_FILE_NAME = 'A2IV_003-053.txt'
+MOCK = """
 S Suvel ma ei ela Jyväskyläs , aga ma elan minu pere ühes teises linnas .
 A 9 10|||R:LEX|||enda||oma|||REQUIRED|||-NONE-|||0
 A 10 11|||R:NOM:FORM|||perega|||REQUIRED|||-NONE-|||0
@@ -102,101 +220,10 @@ A 11 12|||R:VERB:FORM|||paistab|||REQUIRED|||-NONE-|||1
 """
 
 
-def add_to_segments_sql(sentence_uuid, sentence):
-    global segments_sql
-    segments = sentence.split('|||')
-
-    scope = segments[0].split()
-    scope_start = scope[0]
-    scope_end = scope[1]
-    error_type = segments[1]
-    correction = segments[2]
-    annotator_num = segments[5]
-
-    if scope_start != '-1' and scope_end != '-1':
-        segments_sql += "insert into core.text_error_analysis_segments("
-        segments_sql += "id, sentence_id, scope_start, scope_end, error_type, correction, annotator_id"
-        segments_sql += ") values('"
-        segments_sql += str(uuid.uuid4()) + "'::UUID, '"
-        segments_sql += sentence_uuid + "'::UUID, "
-        segments_sql += scope_start + ", " + scope_end + ", '"
-        segments_sql += error_type + "', $$"
-        segments_sql += correction + "$$, "
-        segments_sql += annotator_num + ");\n"
+# sentences, annotations = parse_text(MOCK_FILE_NAME, MOCK)
+# print(annotations)
 
 
-def add_to_sentences_sql(sentence_uuid, get_text_id_sql_query, sentence_index, sentence):
-    global sentences_sql
-    sentences_sql += "insert into core.text_error_analysis_sentences(id, text_id, sentence_num, sentence)"
-    sentences_sql += " values('" + sentence_uuid + "'::UUID"
-    sentences_sql += ", " + get_text_id_sql_query
-    sentences_sql += "::UUID, " + \
-        str(sentence_index) + ", &&" + sentence + "&&);\n"
-
-
-def get_text_id_sql(file_name):
-    level = file_name[:2]
-    extracted_file_name = file_name[2:]
-    sql_query = ''
-    if extracted_file_name[0:5] == '_doc_':
-        extracted_file_name = extracted_file_name[1:-4] + '_item'
-        # core.get_text_id_by_full_code_or_title('doc_18538799202_item');
-        sql_query = "core.get_text_id_by_full_code_or_title('" + \
-            extracted_file_name + "')"
-    elif extracted_file_name[0] == '_':
-        year = extracted_file_name[1:5]
-        extracted_file_name = extracted_file_name[5:-4]
-        # core.get_text_id_by_full_code_or_title('C1 2018 III_003-047');
-        sql_query = "core.get_text_id_by_full_code_or_title('" + \
-            level + " " + year + " "
-        sql_query += extracted_file_name + "')"
-    else:
-        extracted_file_name = extracted_file_name[:-4]
-        # core.get_text_id_by_partial_code_or_title('%III_003-052%');
-        sql_query = "core.get_text_id_by_partial_code_or_title('" + \
-            level + "______" + \
-            extracted_file_name + "')"
-    return sql_query
-
-
-def parse_text(file_name, text):
-    get_text_id_sql_query = get_text_id_sql(file_name)
-    lines = text.splitlines()
-    sentence_count = 0
-    segment_count = 0
-    sentence_uuid = ''
-    for line in lines:
-        if line and line[0] == 'S':
-            segment_count = 0
-            sentence_uuid = str(uuid.uuid4())
-            sentence = line[2:]
-            add_to_sentences_sql(sentence_uuid, get_text_id_sql_query,
-                                 sentence_count, sentence)
-            sentence_count += 1
-        elif line and line[0] == 'A':
-            sentence = line[2:]
-            add_to_segments_sql(sentence_uuid, sentence)
-            segment_count += 1
-
-
-# parse_text(mock_file_name, mock)
-# print(segments_sql)
-
-
-def parse_dir():
-    for subdir in glob.glob(os.path.join(dir, '*/')):
-        path = os.path.dirname(subdir)
-        # subdir_name = os.path.basename(path)
-        for file in glob.glob(os.path.join(subdir, '*.txt')):
-            with open(os.path.join(os.getcwd(), file), 'r') as f:
-                file_name = os.path.basename(file)
-                text = f.read()
-                parse_text(file_name, text)
-
-    with open('sentences_sql.txt', 'w') as file:
-        file.write(sentences_sql)
-        file.write(segments_sql)
-
-
+download_and_unpack_zip(URL)
 parse_dir()
-# print(sentences)
+shutil.rmtree(CORPUS_DIR)
